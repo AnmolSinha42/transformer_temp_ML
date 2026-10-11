@@ -15,6 +15,20 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 SEED = 42
+
+WIN = 15          # temporal window (odd). Larger = more noise averaging, more signal blur
+CAUSAL = False    # True = use only past samples (needed for real-time deployment)
+
+def make_windows(X, win=WIN, causal=CAUSAL):
+    """(n, F) -> (n, win*F). Each row = the window of samples around/ending at that row."""
+    left, right = (win - 1, 0) if causal else (win // 2, win // 2)
+    Xp = np.pad(X, ((left, right), (0, 0)), mode='edge')
+    idx = np.arange(len(X))[:, None] + np.arange(win)[None, :]
+    return Xp[idx].reshape(len(X), -1)
+
+BOTTLENECK = 8    # was 3
+PCA_K = 3   
+
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
@@ -98,26 +112,19 @@ print("Step 3: Initializing Deep Denoising Autoencoder...")
 BOTTLENECK = 3   # PCA shows ~3 components carry the signal in these channels
 
 class DAE(nn.Module):
-    def __init__(self, input_dim=INPUT_DIM, bottleneck=BOTTLENECK):
+    def __init__(self, input_dim=INPUT_DIM * WIN, out_dim=INPUT_DIM, bottleneck=BOTTLENECK):
         super(DAE, self).__init__()
-        # Hourglass architecture: the bottleneck cannot memorise i.i.d. noise
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 16),
-            nn.BatchNorm1d(16),
-            nn.ReLU(),
-            nn.Linear(16, bottleneck)   # linear bottleneck (no ReLU) keeps full signal range
+            nn.Linear(input_dim, 128), nn.ReLU(),
+            nn.Linear(128, bottleneck)
         )
         self.decoder = nn.Sequential(
-            nn.Linear(bottleneck, 16),
-            nn.BatchNorm1d(16),
-            nn.ReLU(),
-            nn.Linear(16, input_dim)
+            nn.Linear(bottleneck, 128), nn.ReLU(),
+            nn.Linear(128, out_dim)
         )
 
     def forward(self, x):
-        encoded = self.encoder(x)
-        decoded = self.decoder(encoded)
-        return decoded
+        return self.decoder(self.encoder(x))
 
 # ==========================================
 # STEP 4: FEED-FORWARD NEURAL NETWORK (FNN)
@@ -146,33 +153,35 @@ FNN_EPOCHS = 50
 PATIENCE = 15   # early stopping on validation loss
 
 def train_dae(snr_db, epochs=DAE_EPOCHS, verbose=True):
-    """Phase 1: noisy -> clean reconstruction. Noise is re-sampled every batch
-    so the DAE sees new corruption each epoch and cannot memorise it."""
     model = DAE()
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.002)
-    loader = DataLoader(TensorDataset(torch.FloatTensor(X_train_clean)),
-                        batch_size=64, shuffle=True)
-    sig_pow = torch.FloatTensor(np.mean(X_train_clean ** 2, axis=0))
-    noise_std = torch.sqrt(sig_pow / (10 ** (snr_db / 10)))
-    Xv_noisy = torch.FloatTensor(make_noisy_splits(snr_db)[1])
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    rng = np.random.default_rng(SEED)
+
+    sig_pow = np.mean(X_train_clean ** 2, axis=0)
+    noise_std = np.sqrt(sig_pow / (10 ** (snr_db / 10)))
+    Xc = torch.FloatTensor(X_train_clean)
     Xv_clean = torch.FloatTensor(X_val_clean)
 
     best_val, best_state, wait = float('inf'), None, 0
     for epoch in range(epochs):
         model.train()
+        noisy = X_train_clean + rng.normal(size=X_train_clean.shape) * noise_std
+        loader = DataLoader(TensorDataset(torch.FloatTensor(make_windows(noisy)), Xc),
+                            batch_size=64, shuffle=True)
         total = 0
-        for (batch_clean_x,) in loader:
-            batch_noisy_x = batch_clean_x + torch.randn_like(batch_clean_x) * noise_std
+        for bx, by in loader:
             optimizer.zero_grad()
-            loss = criterion(model(batch_noisy_x), batch_clean_x)  # map noisy -> clean
+            loss = criterion(model(bx), by)   # noisy window -> clean centre sample
             loss.backward()
             optimizer.step()
             total += loss.item()
 
         model.eval()
         with torch.no_grad():
-            val_loss = criterion(model(Xv_noisy), Xv_clean).item()
+            Xv_noisy = X_val_clean + rng.normal(size=X_val_clean.shape) * noise_std
+            val_loss = criterion(model(torch.FloatTensor(make_windows(Xv_noisy))), Xv_clean).item()
+
         if val_loss < best_val:
             best_val, best_state, wait = val_loss, copy.deepcopy(model.state_dict()), 0
         else:
@@ -185,12 +194,12 @@ def train_dae(snr_db, epochs=DAE_EPOCHS, verbose=True):
             break
 
     model.load_state_dict(best_state)
-    model.eval()   # frozen static filter from here on
+    model.eval()
     return model
 
 def denoise(dae, X):
     with torch.no_grad():
-        return dae(torch.FloatTensor(X)).numpy()
+        return dae(torch.FloatTensor(make_windows(X))).numpy()
 
 def train_fnn(X_tr, y_tr, X_va, y_va, epochs=FNN_EPOCHS, verbose=True):
     """Phase 2: features -> steady-state temperatures (normalised space)."""
@@ -288,6 +297,11 @@ def calculate_snr(clean_signal, corrupted_signal):
         return float('inf')
     return 10 * np.log10(signal_power / noise_power)
 
+# --- diagnostic: best SNR a plain moving average could reach (no noise involved) ---
+from scipy.ndimage import uniform_filter1d     # (or move this import to the top)
+sm = uniform_filter1d(X_test_clean, size=WIN, axis=0, mode='nearest')
+print(f"Smoothing floor @ WIN={WIN}: {calculate_snr(X_test_clean, sm):.2f} dB")
+
 input_snr = calculate_snr(X_test_clean, X_test_noisy)
 output_snr = calculate_snr(X_test_clean, cleaned_test)
 
@@ -297,9 +311,8 @@ print(f"Output Signal-to-Noise Ratio:   {output_snr:.2f} dB")
 print(f"Net SNR Improvement:            {output_snr - input_snr:.2f} dB")
 
 # Linear reference: PCA with the same number of components as the DAE bottleneck
-pca = PCA(n_components=BOTTLENECK).fit(X_train_clean)
-pca_snr = calculate_snr(X_test_clean, pca.inverse_transform(pca.transform(X_test_noisy)))
-print(f"PCA (k={BOTTLENECK}) reference output SNR: {pca_snr:.2f} dB  (linear denoising ceiling)")
+pca = PCA(n_components=PCA_K).fit(X_train_clean)
+print(f"PCA (k={PCA_K}) reference output SNR: ...")
 
 # ==========================================
 # STEP 7: BASELINE COMPARISON (OBJECTIVES 1 & 4)
